@@ -219,6 +219,27 @@ Idx  Counter            count  Meaning
 
 It only needs Python 3 and `bpftool`.
 
+### Debug tracing
+
+When a clamp happens the program emits a `bpf_printk()` line with the old and
+new MSS to the kernel trace pipe. Watch it live with either:
+
+```bash
+sudo bpftool prog tracelog
+# or the raw pipe:
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
+
+You'll see one line per clamped SYN, e.g.:
+
+```
+<idle>-0  [002] ..s.1  1234.567: bpf_trace_printk: mss-clamp: old=1460 new=1410
+```
+
+This is a **debug aid only** — `bpf_printk` is slow and system-wide, so remove
+the call (in `ebpf-tunnel-clamp-mss.c`) and rebuild before production use. It
+requires a `GPL` program license, which this program already declares.
+
 ## FRR router image
 
 `Dockerfile.frr` builds a router image based on the latest released
