@@ -1,0 +1,113 @@
+# syntax=docker/dockerfile:1
+#
+# FRR router image with WireGuard and the TCP MSS clamp eBPF program baked in.
+#
+#   Stage 1 (builder): compile the eBPF object with clang/LLVM.
+#   Stage 2 (frr):     latest released FRR image + wireguard-tools + the object.
+#
+# Build:  docker build -f Dockerfile.frr -t frr-mss-clamp .
+# Run:    docker run --rm -it --privileged --network host frr-mss-clamp
+#         (NET_ADMIN + access to /sys/fs/bpf are required to attach the program)
+
+# Latest released FRR (see https://quay.io/repository/frrouting/frr?tab=tags).
+# Docker Hub's frrouting/frr is stale; quay.io tracks current releases.
+# Declared globally so it can be used in the FROM below; override with
+#   docker build --build-arg FRR_VERSION=x.y.z ...
+ARG FRR_VERSION=10.6.1
+
+# ---------------------------------------------------------------------------
+# Stage 1 - compile the eBPF object
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    clang \
+    llvm \
+    libbpf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY ebpf-tunnel-clamp-mss.c .
+RUN clang -O2 -g -target bpf \
+    -D__TARGET_ARCH_x86 \
+    -I/usr/include/x86_64-linux-gnu \
+    -c ebpf-tunnel-clamp-mss.c \
+    -o ebpf-tunnel-clamp-mss.o
+
+# ---------------------------------------------------------------------------
+# Stage 2 - FRR + WireGuard + the eBPF plugin
+# ---------------------------------------------------------------------------
+FROM quay.io/frrouting/frr:${FRR_VERSION}
+
+# WireGuard userspace tooling + bpftool + python3 for the stats helper
+# (iproute2/tc already ship in the image)
+RUN apk add --no-cache \
+    wireguard-tools \
+    bpftool \
+    libbpf \
+    python3
+
+# Install the compiled eBPF program
+COPY --from=builder /build/ebpf-tunnel-clamp-mss.o /usr/lib/bpf/ebpf-tunnel-clamp-mss.o
+
+# Stats helper: summarises the mss_stats per-CPU counters. Usage: mss-clamp-stats
+COPY mss-clamp-stats.py /usr/local/bin/mss-clamp-stats
+RUN chmod +x /usr/local/bin/mss-clamp-stats
+
+# Loader helper: attach the MSS clamp to an interface (default wg0) and pin the
+# stats map. Usage inside the container: load-mss-clamp [interface]
+RUN <<'EOF' sh
+set -eu
+cat > /usr/local/bin/load-mss-clamp <<'SCRIPT'
+#!/bin/sh
+# Attach the TCP MSS clamp eBPF program to a tunnel interface (egress).
+#
+# The object uses libbpf-style BTF map definitions, which iproute2's built-in
+# ELF loader does not understand, so we load + pin it with bpftool (libbpf) and
+# then attach the pinned program with tc.
+set -eu
+IFACE="${1:-${MSS_CLAMP_IFACE:-wg0}}"
+OBJ="/usr/lib/bpf/ebpf-tunnel-clamp-mss.o"
+PIN="/sys/fs/bpf/mss-clamp"
+
+# Ensure the bpf filesystem is mounted.
+mount | grep -q " /sys/fs/bpf " || mount -t bpf bpf /sys/fs/bpf
+
+# Load the program + its maps once and pin them (libbpf understands SEC("tc")
+# and the BTF .maps section).
+if [ ! -e "${PIN}/clamp_mss_egress" ]; then
+    bpftool prog loadall "$OBJ" "$PIN" type tc pinmaps "$PIN"
+fi
+
+# Attach on egress via a clsact qdisc.
+tc qdisc add dev "$IFACE" clsact 2>/dev/null || true
+
+if [ "${MSS_CLAMP_SYN_ONLY:-0}" = "1" ]; then
+    # Pre-filter with flower so only TCP SYN/SYN-ACK packets reach the program.
+    # Only correct when the inner TCP header is visible at this attach point
+    # (locally-originated or decapsulated traffic on a tunnel interface). It is
+    # NOT suitable on an encapsulating underlay (e.g. VXLAN transit on eth0),
+    # where the outer header is UDP and no SYN would ever match.
+    #
+    # chain 0: SYN/SYN-ACK (SYN bit set, other flags masked) -> goto chain 1;
+    #          all other packets fall through unmatched and pass untouched.
+    # chain 1: run the MSS-clamp classifier.
+    tc filter replace dev "$IFACE" egress chain 0 protocol ip   prio 1 \
+        flower ip_proto tcp tcp_flags 0x2/0x2 action goto chain 1
+    tc filter replace dev "$IFACE" egress chain 0 protocol ipv6 prio 2 \
+        flower ip_proto tcp tcp_flags 0x2/0x2 action goto chain 1
+    tc filter replace dev "$IFACE" egress chain 1 prio 1 \
+        bpf direct-action pinned "${PIN}/clamp_mss_egress"
+    echo "MSS clamp attached to ${IFACE} (egress, SYN-only pre-filter)."
+else
+    tc filter replace dev "$IFACE" egress bpf direct-action pinned "${PIN}/clamp_mss_egress"
+    echo "MSS clamp attached to ${IFACE} (egress)."
+fi
+
+echo "Stats: mss-clamp-stats   (or: bpftool map dump pinned ${PIN}/mss_stats)"
+SCRIPT
+chmod +x /usr/local/bin/load-mss-clamp
+EOF
+
+# Keep FRR's original entrypoint/CMD (the base image starts the routing daemons).

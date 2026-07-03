@@ -1,0 +1,18 @@
+# Compiled eBPF object (build artifact)
+*.o
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# netlab / containerlab generated lab state (produced by `netlab up`)
+ansible.cfg
+clab.yml
+hosts.yml
+group_vars/
+host_vars/
+node_files/
+clab-*/
+netlab.lock
+netlab.snapshot.pickle
+*.log

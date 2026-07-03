@@ -1,0 +1,125 @@
+---
+# ===========================================================================
+# WireGuard MSS-clamp test bed (netlab topology)
+#
+# Based on tests/integration/tunnel/03-wireguard.yml from the netlab repo.
+#
+#   h1 ---- r1 ==================( WireGuard tunnel )================== r2 ---- h2
+#          (frr)   OSPF runs over the tunnel; core link is the underlay   (frr)
+#
+# Two FRR routers build a WireGuard tunnel over a routed "core" underlay and
+# run OSPF across it. A Linux host hangs off each router; h1 uses wget to pull
+# a test file from an HTTP server on h2, so the TCP transfer traverses the
+# tunnel.
+#
+# Why this is a useful test bed for SDN-MSS-Clamp: with a 1500-byte underlay
+# the WireGuard tunnel MTU is ~1440 (IPv4 transport), which is smaller than the
+# 1500-byte host LANs. Bulk TCP therefore needs its MSS clamped to fit the
+# tunnel. After "netlab up", load the eBPF clamp from this repo on the routers'
+# WireGuard interface (e.g. `load-mss-clamp wg0`) to see it in action.
+# ===========================================================================
+
+message: |
+  h1 --- r1 === WireGuard tunnel === r2 --- h2
+
+  OSPF runs over the WireGuard tunnel. h1 downloads a test file from an HTTP
+  server on h2 with wget, so the TCP flow crosses the tunnel. Load the eBPF MSS
+  clamp on r1/r2 wg interfaces to clamp the handshake MSS to the tunnel MTU.
+
+provider: clab
+
+plugin: [ files, tunnel.wireguard ]
+
+addressing:
+  core:                              # underlay pool used as the tunnel transport
+    ipv4: 172.22.0.0/16
+
+groups:
+  routers:
+    device: frr
+    module: [ ospf ]
+    members: [ r1, r2 ]
+    config: [ wireguard ]
+    # Custom FRR runtime image built from Dockerfile.frr: it bundles
+    # wireguard-tools, bpftool, the compiled eBPF clamp at
+    # /usr/lib/bpf/ebpf-tunnel-clamp-mss.o, and the `load-mss-clamp` helper.
+    # Build it first with:  make runtime   (or: docker build -f Dockerfile.frr -t frr-mss-clamp .)
+    clab.image: frr-mss-clamp:latest
+  hosts:
+    device: linux                    # Linux hosts auto-get static routes to the
+    members: [ h1, h2 ]              # lab subnets via their local router gateway
+
+nodes:
+  r1:
+  r2:
+  h1:
+  h2:
+
+links:
+# Routed underlay between the two routers - carries the encrypted WireGuard
+# traffic. OSPF is disabled here; it only runs inside the tunnel.
+- r1:
+  r2:
+  role: core
+  pool: core
+  ospf: False
+
+# The WireGuard tunnel itself. Keys are pinned (test values) so the lab does
+# not depend on wireguard-tools being installed on the netlab host; omit them
+# to have the plugin auto-generate a key pair instead.
+- r1:
+    tunnel.private_key: dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=
+    tunnel.public_key: hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=
+  r2:
+    tunnel.private_key: XasIfmJKikt54X+Lg4AO5m87sSkmGLb9HC+LJ/+I4Os=
+    tunnel.public_key: 3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=
+  tunnel.mode: wireguard
+  tunnel.source.link.role: core
+  mtu: 1440                          # tunnel MTU < 1500 host LANs -> MSS needs
+                                     # clamping (1440 - 40 = 1400 for IPv4 TCP)
+
+# Host access links
+- h1:
+  r1:
+- h2:
+  r2:
+
+configlets:
+  wireguard:
+    frr: |
+      #!/bin/bash
+      set -e
+      /usr/local/bin/load-mss-clamp tun0
+      exit $?
+
+validate:
+  adj:
+    description: Check the OSPF adjacency across the WireGuard tunnel
+    wait: 60
+    wait_msg: Waiting for the OSPF adjacency over the tunnel
+    nodes: [ r1 ]
+    plugin: ospf_neighbor(nodes.r2.ospf.router_id)
+
+  server:
+    description: Create an 8 MiB test file and start an HTTP server on h2
+    nodes: [ h2 ]
+    devices: [ linux ]
+    exec: >-
+      dd if=/dev/zero of=/tmp/testfile bs=1M count=8 2>/dev/null;
+      cd /tmp;
+      nohup python3 -m http.server 8080 >/dev/null 2>&1 &
+      sleep 1;
+      echo READY
+    valid: >-
+      'READY' in stdout
+
+  transfer:
+    description: h1 downloads the test file from h2 with wget over the tunnel
+    wait: 10
+    wait_msg: Waiting for OSPF routes to converge, then transferring
+    nodes: [ h1 ]
+    devices: [ linux ]
+    exec: >-
+      wget -q -O /tmp/got http://h2:8080/testfile && wc -c < /tmp/got
+    valid: >-
+      '8388608' in stdout
